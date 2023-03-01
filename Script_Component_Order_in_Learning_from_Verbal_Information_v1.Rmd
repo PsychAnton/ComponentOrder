@@ -1,0 +1,717 @@
+---
+title: "Component Order in Learning from Verbal Information"
+author: "Anton Koger"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: TRUE
+    toc_float: TRUE
+    toc_depth: 3
+    number_sections: TRUE
+  pdf_document: default
+  word_document: default
+always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Preparations
+
+## Plugins 
+```{r dat4, echo=TRUE, out.extra='hide', warning=FALSE, message=FALSE}
+library(emmeans)
+library(ggpubr)
+library(Rmisc)
+library(dplyr)
+library(data.table)
+library(psych)
+library(afex)
+library(ggplot2)
+```
+
+
+## Importing Data 
+```{r}
+# set working directory
+setwd("./data")
+
+
+# create list with all files with the task from all versions
+file_list = list.files(pattern = "*.csv") 
+# import these files to one list
+df_list = lapply(file_list, read.csv)
+# add all data frames in this list into one data frame
+data = rbindlist(df_list, fill = TRUE)
+# clean up
+rm(file_list, df_list)
+
+# save original data in dataset
+data_original = data
+```
+
+
+## Renaming and Adding Variables
+```{r}
+
+# renaming
+data = rename(data,
+             effectPrime = trialType, 
+             compOrderCode = sentenceOrder,
+             compOrder = sentenceOrderText,
+             verbalResp = colorKey,
+             meanError_ID = meanError,
+             meanRT_ID = meanRT)
+
+# new variable for required response
+data = mutate(data, reqResp = cor_resp)
+# and now change the lables
+data = mutate(data, reqResp = case_when(reqResp == "Q" ~ "left",
+                                        reqResp == "P" ~ "right"))
+
+# new variable for age
+data = mutate(data, age = 2022 - data$yearBorn)
+
+```
+
+
+
+## Preparing Data
+```{r}
+# only keep main trials and rows in which a response was made
+# (exclude instructions, practice trials, fixation, and error feedback)
+data_main = filter(data, blockType == "main")
+
+# delete too slow responses
+data_main = mutate(data_main, tooSlow = case_when(respValue == "q" ~ 0,
+                                                  respValue == "p" ~ 0,
+                                                  TRUE ~ 1))
+
+data_main = filter(data_main, tooSlow != 1)
+
+# change data type of rt from chr to int
+# note: there are NA, as no rt are present when responses were too slow
+data_main = mutate(data_main, rt = as.numeric(rt))
+
+# factorize data
+data_main = data_main %>%
+  mutate(ID = as.factor(ID),
+         verbalResp = as.factor(verbalResp),
+         reqResp = as.factor(reqResp),
+         effectPrime = as.factor(effectPrime),
+         compOrder = as.factor(compOrder))
+
+# some participants wrote their age instead of the year of birth
+data_main = data_main %>%
+  mutate(yearBorn = case_when(yearBorn == 26 ~ 1996,
+                              yearBorn == 28 ~ 1994,
+                              yearBorn == 36 ~ 1986,
+                              yearBorn == 50 ~ 1972,
+                              TRUE ~ as.numeric(as.character(yearBorn))))
+
+
+
+```
+
+
+
+## First Look
+```{r}
+# aggregate dataset per participant (while discarding later excluded participants)
+data_agg = data_original %>%
+  filter(ID != "ecdrnqhw" &
+           ID != "cppygz8l" &
+           ID != "wzgg40tc") %>%
+    mutate(yearBorn = case_when(yearBorn == 26 ~ 1996,
+                              yearBorn == 28 ~ 1994,
+                              yearBorn == 36 ~ 1986,
+                              yearBorn == 50 ~ 1972,
+                              TRUE ~ as.numeric(as.character(yearBorn)))) %>%
+  group_by(ID) %>%
+  summarise(balancing = mean(balancing),
+            balancingText = first(balancingText),
+            sentenceOrder = mean(sentenceOrder),
+            sentenceOrderText = first(sentenceOrderText),
+            colorKey = first(colorKey),
+            meanRT = first(meanRT),
+            meanError_RT = first(meanError),
+            gender = first(gender),
+            yearBorn = first(yearBorn),
+            age = 2022 - first(yearBorn))
+
+# check balancing
+table(data_agg$balancingText)
+table(data_agg$sentenceOrderText)
+table(data_agg$colorKey)
+
+
+# look at mean rt and error rates
+# # change rt variable type
+# data$rt = as.numeric(data$rt)
+# # only keep main trials with a response
+# data = data %>%
+#   filter(blockType == "main")
+# error rates
+mean(data_main$error)
+sd(data_main$error)
+# rt
+mean(data_main$rt, na.rm = TRUE)
+sd(data_main$rt, na.rm = TRUE)
+
+
+##### Step 1: get familiar with the data ####
+summary(data)
+describe(data)
+
+# lets see how many pp we have
+uniqueN(data$ID)
+
+# lets check how many trials each pp has
+count(data, ID)
+
+
+
+###for RT per pp###
+# mean RT per pp in a Boxplot
+boxplot(tapply(data_main$rt, data_main$ID, mean))$out
+# scatterplot
+plot(tapply(data_main$rt, data_main$ID, mean))
+
+
+###for errors per pp###
+# mean error per pp in a Boxplot
+boxplot(tapply(data_main$error, data_main$ID, mean))$out
+# there are 2 pp with higher error rates (above 20%)
+# and a scatterplot
+plot(tapply(data_main$error, data_main$ID, mean))
+
+hist(tapply(data_main$error, data_main$ID, mean))
+
+
+
+```
+
+
+
+# Data Cleaning 
+
+- Participants showing random responses (~50% errors and above) will be removed. 
+- Participants that are "extrem" outliers (boxplot, 3*IQR) on mean response times or mean error rate will be removed.
+- Participants having more than 10% of responses below 300 ms will be removed.
+- For response time analyses, response errors will be removed.
+- Response times below 150 ms will be excluded from the analysis.
+- Individual response times that are beyond 3*SD above/below the mean (calculated per participant and within participant condition) will be removed.
+
+## Remove Participants With Extrem Outliers (Errors and RT) and Random Responses
+```{r}
+### Participants showing random responses (~50% errors and above) will be removed. 
+### Participants that are "extrem" outliers (boxplot, 3*IQR) on mean response times or mean error rate will be removed.
+# mean RT per pp in a Boxplot
+boxplot(tapply(data_main$rt, data_main$ID, mean),
+        main="Mean RT per Participant",
+        ylab="RT in ms")
+# mean error per pp in a Boxplot
+boxplot(tapply(data_main$error, data_main$ID, mean)*100,
+        main="Mean Errors per Participant",
+        ylab="Error Rate in %")
+
+# Participants above 40% errors
+names(which(tapply(data_main$error, data_main$ID, mean) > .4))
+# Removing participants who had around 50% errors
+data_main = filter(data_main, ID != "ecdrnqhw" &
+                              ID != "cppygz8l")
+# delete empty factor levels
+data_main$ID = droplevels(data_main$ID)
+
+
+### Participants having more than 10% of responses below 300 ms will be removed.
+# create new variable which tells us if the RT was below 300ms
+data_main = data_main %>%
+  group_by(ID) %>%
+  mutate(rtBelow300 = ifelse(rt < 300, 1, 0))
+# now count how many times this happens per participant 
+# and only show those, where it happens more than 10% (9 times)
+names(which(tapply(data_main$rtBelow300, data_main$ID, sum) > 9))
+# Removing participant who had more than 10% of the responses faster than 300 ms
+data_main = filter(data_main, ID != "wzgg40tc")
+# delete empty factor levels
+data_main$ID = droplevels(data_main$ID)
+
+
+### Response times below 150 ms will be excluded from the analysis.
+data_main = filter(data_main, rt > 150)
+
+
+### For response time analyses, response errors will be removed.
+data_main_rt = filter(data_main, error == 0)
+
+
+### Individual response times that are beyond 3*SD above/below the mean (calculated per participant and within participant condition) will be removed.
+# add mean and SD of RT per participant and within condition into new columns
+data_main_rt = data_main_rt %>%
+  ungroup() %>%
+  mutate(meanRTcell = ave(data_main_rt$rt, 
+                          list(data_main_rt$ID, data_main_rt$reqResp, data_main_rt$effectPrime), 
+                          FUN = mean),
+         sdRTcell = ave(data_main_rt$rt, 
+                          list(data_main_rt$ID, data_main_rt$reqResp, data_main_rt$effectPrime), 
+                          FUN = sd))
+# add column which codes whether a trial is an outlier
+data_main_rt = data_main_rt %>%
+  mutate(outlierRT = case_when(rt > (meanRTcell + 3*sdRTcell) ~ 1,
+                               rt < (meanRTcell - 3*sdRTcell) ~ 1,
+                               TRUE ~ 0))
+# delete trials which are an RT outlier 
+data_main_rt = filter(data_main_rt, outlierRT == 0)
+
+
+```
+
+
+
+## Demographic info 
+```{r}
+
+# tables 
+table(data_agg$gender)
+
+table(data_agg$age)
+
+mean(data_agg$age)
+sd(data_agg$age)
+range(data_agg$age)
+
+
+
+
+```
+
+
+# Analysis
+
+## Error Rates
+
+### Preparation (Data Aggregation)
+```{r}
+# aggregate dataset for error analysis
+data_main_error_agg = data_main %>%
+  group_by(ID, verbalResp, reqResp, effectPrime, compOrder) %>%
+  summarise(meanError = mean(error)); show(data_main_error_agg)
+
+
+```
+
+
+### Error Analysis (4-Way)
+```{r}
+
+# ez ANOVA
+aov_error = aov_ez(id = "ID",
+                   dv = "meanError",
+                   data = data_main_error_agg,
+                   between = c("compOrder", "verbalResp"),
+                   within = c("reqResp", "effectPrime")); show(aov_error)
+
+
+## means
+meanError <- summarySEwithin(data_main_error_agg, measurevar = 'meanError',
+                          withinvars = c("reqResp", "effectPrime"),
+                          betweenvars = c("compOrder", "verbalResp"),
+                          idvar = 'ID',
+                          na.rm = T); head(meanError)
+
+# (meanError_2 = data_main_error_agg %>%
+#     ungroup() %>%
+#     group_by(verbalResp, reqResp, effectPrime, compOrder) %>%
+#     summarise(error = mean(meanError)) %>%
+#     mutate(error = as.numeric(error)*100))
+
+
+```
+
+
+
+### Error Analysis (3-Way)
+```{r}
+
+# ez ANOVA for Effect-Action Order
+aov_error_effect_action = aov_ez(id = "ID",
+                                 dv = "meanError",
+                                 data = filter(data_main_error_agg, compOrder == "effect_action"),
+                                 between = c("verbalResp"),
+                                 within = c("reqResp", "effectPrime")); show(aov_error_effect_action)
+
+# ez ANOVA for Action-Effect Order
+aov_error_action_effect = aov_ez(id = "ID",
+                                 dv = "meanError",
+                                 data = filter(data_main_error_agg, compOrder == "action_effect"),
+                                 between = c("verbalResp"),
+                                 within = c("reqResp", "effectPrime")); show(aov_error_action_effect)
+
+```
+
+
+
+### Error Analysis (2-Way) and Contrasts
+```{r}
+
+### Effect-Action Order
+## Prime critical
+aov_error_effect_action_effectPrime_critical = aov_ez(id = "ID",
+                                                     dv = "meanError",
+                                                     data = filter(data_main_error_agg, compOrder == "effect_action" &
+                                                                     effectPrime == "critical"),
+                                                     between = c("verbalResp"),
+                                                     within = c("reqResp")); show(aov_error_effect_action_effectPrime_critical)
+
+# now contrasts with these results
+emmeans(aov_error_effect_action_effectPrime_critical, ~ reqResp * verbalResp)
+(contrasts_error_effect_action_effectPrime_critical_reqResp_x_verbalResp = pairs(emmeans(aov_error_effect_action_effectPrime_critical, ~ reqResp * verbalResp)))
+
+## Prime neutral
+aov_error_effect_action_effectPrime_neutral = aov_ez(id = "ID",
+                                                     dv = "meanError",
+                                                     data = filter(data_main_error_agg, compOrder == "effect_action" &
+                                                                     effectPrime == "neutral"),
+                                                     between = c("verbalResp"),
+                                                     within = c("reqResp")); show(aov_error_effect_action_effectPrime_neutral)
+
+# # now contrasts with these results
+# emmeans(aov_error_effect_action_effectPrime_neutral, ~ reqResp * verbalResp)
+# (contrasts_error_effect_action_effectPrime_neutral_reqResp_x_verbalResp = pairs(emmeans(aov_error_effect_action_effectPrime_neutral, ~ reqResp * verbalResp)))
+
+
+### Action-Effect Order
+## Prime critical
+aov_error_action_effect_effectPrime_critical = aov_ez(id = "ID",
+                                                     dv = "meanError",
+                                                     data = filter(data_main_error_agg, compOrder == "action_effect" &
+                                                                     effectPrime == "critical"),
+                                                     between = c("verbalResp"),
+                                                     within = c("reqResp")); show(aov_error_action_effect_effectPrime_critical)
+
+# now contrasts with these results
+emmeans(aov_error_action_effect_effectPrime_critical, ~ reqResp * verbalResp)
+(contrasts_error_action_effect_effectPrime_critical_reqResp_x_verbalResp = pairs(emmeans(aov_error_action_effect_effectPrime_critical, ~ reqResp * verbalResp)))
+
+## Prime neutral
+aov_error_action_effect_effectPrime_neutral = aov_ez(id = "ID",
+                                                     dv = "meanError",
+                                                     data = filter(data_main_error_agg, compOrder == "action_effect" &
+                                                                     effectPrime == "neutral"),
+                                                     between = c("verbalResp"),
+                                                     within = c("reqResp")); show(aov_error_action_effect_effectPrime_neutral)
+
+# # now contrasts with these results
+# emmeans(aov_error_action_effect_effectPrime_neutral, ~ reqResp * verbalResp)
+# (contrasts_error_effect_action_effectPrime_neutral_reqResp_x_verbalResp = pairs(emmeans(aov_error_action_effect_effectPrime_neutral, ~ reqResp * verbalResp)))
+
+
+
+
+```
+
+
+
+
+### Graphs Errors
+```{r}
+
+# Effect-Action Order
+plot_error_effect_action = 
+  ggplot(filter(meanError, compOrder == "effect_action"),
+         aes(x=reqResp, y=meanError, fill=verbalResp)) +
+  geom_bar(stat = "summary", fun = mean, position = 'dodge', color = 'black', size = .8) + 
+  geom_errorbar(aes(ymin=meanError-ci, ymax=meanError+ci),
+                width=.2,
+                size= .5,
+                position=position_dodge(.9)) +
+  facet_grid(.~ effectPrime) +
+  coord_cartesian(ylim = c(0, 0.16)) +                                                                  # <---
+  scale_y_continuous(breaks=c(0, 0.02, 0.04, 0.06, 0.08, 0.1, 0.12, 0.14, 0.16), expand = c(0, 0)) +    # <---
+  scale_fill_manual(values=c("white", "gray40"))+
+  xlab('Required response') +
+  ylab('Mean proportion of errors') +
+  guides(fill=guide_legend(title="Instructed response")) +
+  ggtitle("Effect-action order") +
+  theme(panel.border = element_blank(),
+        plot.title            = element_text(size = 20, face = "bold", hjust = 0.5),
+        legend.position       = 'none',                                                 #c(0.75, 0.8),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.title          = element_text(size  = 18, face="bold"),
+        legend.text           = element_text(size  = 18),
+        legend.box.background = element_rect(fill  = "white"),
+        plot.background       = element_rect(fill  = "white"),
+        panel.background      = element_rect(fill  = "white"),
+        axis.line.x           = element_line(colour  = "black"),                       # <---
+        axis.line.y           = element_line(colour  = "black"),                       # <---
+        axis.title.x          = element_text(size  = 18),                              #,hjust = 0.5, vjust = -0.5),
+        axis.title.y          = element_text(size  = 18),                              #,hjust = 0.5, vjust = 2),
+        #plot.title            = element_text(hjust = 0.5), 
+        strip.text.x          = element_text(size  = 18, color = 'black'),
+        axis.text.x           = element_text(size  = 18, color = 'black'),
+        axis.text.y           = element_text(size  = 16, color = 'black')
+  ); plot_error_effect_action
+
+
+# Action-Effect Order
+plot_error_action_effect = 
+  ggplot(filter(meanError, compOrder == "action_effect"),
+         aes(x=reqResp, y=meanError, fill=verbalResp)) +
+  geom_bar(stat = "summary", fun = mean, position = 'dodge', color = 'black', size = .8) + 
+  geom_errorbar(aes(ymin=meanError-ci, ymax=meanError+ci),
+                width=.2,
+                size= .5,
+                position=position_dodge(.9)) +
+  facet_grid(.~ effectPrime) +
+  coord_cartesian(ylim = c(0, 0.16)) +                                                                  # <---
+  scale_y_continuous(breaks=c(0, 0.02, 0.04, 0.06, 0.08, 0.1, 0.12, 0.14, 0.16), expand = c(0, 0)) +    # <---
+  scale_fill_manual(values=c("white", "gray40"))+
+  xlab('Required response') +
+  ylab('Mean proportion of errors') +
+  guides(fill=guide_legend(title="Instructed response")) +
+  ggtitle("Action-effect order") +
+  theme(panel.border = element_blank(),
+        plot.title            = element_text(size = 20, face = "bold", hjust = 0.5),
+        legend.position       = 'none',                                                 #c(0.75, 0.8),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.title          = element_text(size  = 18, face="bold"),
+        legend.text           = element_text(size  = 18),
+        legend.box.background = element_rect(fill  = "white"),
+        plot.background       = element_rect(fill  = "white"),
+        panel.background      = element_rect(fill  = "white"),
+        axis.line.x           = element_line(colour  = "black"),                       # <---
+        axis.line.y           = element_line(colour  = "black"),                       # <---
+        axis.title.x          = element_text(size  = 18),                              #,hjust = 0.5, vjust = -0.5),
+        axis.title.y          = element_text(size  = 18),                              #,hjust = 0.5, vjust = 2),
+        #plot.title            = element_text(hjust = 0.5), 
+        strip.text.x          = element_text(size  = 18, color = 'black'),
+        axis.text.x           = element_text(size  = 18, color = 'black'),
+        axis.text.y           = element_text(size  = 16, color = 'black')
+  ); plot_error_action_effect
+
+
+
+## Combined
+plot_error = ggarrange(plot_error_effect_action, plot_error_action_effect,
+                             labels = c('a.', 'b.'), ncol = 2, nrow = 1,  common.legend = F); plot_error
+
+```
+
+
+
+
+## Reaction Times 
+
+### Preparation (Data Aggregation)
+
+```{r}
+# aggregate dataset for error analysis
+data_main_rt_agg = data_main_rt %>%
+  group_by(ID, verbalResp, reqResp, effectPrime, compOrder) %>%
+  summarise(meanRT = mean(rt)); show(data_main_rt_agg)
+
+
+```
+
+### Reaction Time Analysis (4-Way)
+```{r}
+
+# ez ANOVA
+aov_rt = aov_ez(id = "ID",
+                dv = "meanRT",
+                data = data_main_rt_agg,
+                between = c("compOrder", "verbalResp"),
+                within = c("reqResp", "effectPrime")); show(aov_rt)
+
+
+## means 
+meanRT <- summarySEwithin(data_main_rt_agg, measurevar = 'meanRT',
+                          withinvars = c("reqResp", "effectPrime"),
+                          betweenvars = c("compOrder", "verbalResp"),
+                          idvar = 'ID',
+                          na.rm = T); head(meanRT)
+
+# (meanRT_2 = data_main_rt_agg %>%
+#     ungroup() %>%
+#     group_by(verbalResp, reqResp, effectPrime, compOrder) %>%
+#     summarise(rt = mean(meanRT)))
+
+
+```
+
+
+### Reaction Time Analysis (3-Way)
+```{r}
+
+# ez ANOVA for Effect-Action Order
+aov_rt_effect_action = aov_ez(id = "ID",
+                                 dv = "meanRT",
+                                 data = filter(data_main_rt_agg, compOrder == "effect_action"),
+                                 between = c("verbalResp"),
+                                 within = c("reqResp", "effectPrime")); show(aov_rt_effect_action)
+
+# ez ANOVA for Action-Effect Order
+aov_rt_action_effect = aov_ez(id = "ID",
+                                 dv = "meanRT",
+                                 data = filter(data_main_rt_agg, compOrder == "action_effect"),
+                                 between = c("verbalResp"),
+                                 within = c("reqResp", "effectPrime")); show(aov_rt_action_effect)
+
+
+```
+
+
+
+
+### Reaction Time Analysis (2-Way) and Contrasts
+```{r}
+
+### Effect-Action Order
+## Prime critical
+aov_rt_effect_action_effectPrime_critical = aov_ez(id = "ID",
+                                                     dv = "meanRT",
+                                                     data = filter(data_main_rt_agg, compOrder == "effect_action" &
+                                                                     effectPrime == "critical"),
+                                                     between = c("verbalResp"),
+                                                     within = c("reqResp")); show(aov_rt_effect_action_effectPrime_critical)
+
+# now contrasts with these results
+emmeans(aov_rt_effect_action_effectPrime_critical, ~ reqResp * verbalResp)
+(contrasts_rt_effect_action_effectPrime_critical_reqResp_x_verbalResp = pairs(emmeans(aov_rt_effect_action_effectPrime_critical, ~ reqResp * verbalResp)))
+
+## Prime neutral
+aov_rt_effect_action_effectPrime_neutral = aov_ez(id = "ID",
+                                                     dv = "meanRT",
+                                                     data = filter(data_main_rt_agg, compOrder == "effect_action" &
+                                                                     effectPrime == "neutral"),
+                                                     between = c("verbalResp"),
+                                                     within = c("reqResp")); show(aov_rt_effect_action_effectPrime_neutral)
+
+# # now contrasts with these results
+# emmeans(aov_rt_effect_action_effectPrime_neutral, ~ reqResp * verbalResp)
+# (contrasts_rt_effect_action_effectPrime_neutral_reqResp_x_verbalResp = pairs(emmeans(aov_rt_effect_action_effectPrime_neutral, ~ reqResp * verbalResp)))
+
+
+### Action-Effect Order
+## Prime critical
+aov_rt_action_effect_effectPrime_critical = aov_ez(id = "ID",
+                                                     dv = "meanRT",
+                                                     data = filter(data_main_rt_agg, compOrder == "action_effect" &
+                                                                     effectPrime == "critical"),
+                                                     between = c("verbalResp"),
+                                                     within = c("reqResp")); show(aov_rt_action_effect_effectPrime_critical)
+
+# now contrasts with these results
+emmeans(aov_rt_action_effect_effectPrime_critical, ~ reqResp * verbalResp)
+(contrasts_rt_action_effect_effectPrime_critical_reqResp_x_verbalResp = pairs(emmeans(aov_rt_action_effect_effectPrime_critical, ~ reqResp * verbalResp)))
+
+## Prime neutral
+aov_rt_action_effect_effectPrime_neutral = aov_ez(id = "ID",
+                                                     dv = "meanRT",
+                                                     data = filter(data_main_rt_agg, compOrder == "action_effect" &
+                                                                     effectPrime == "neutral"),
+                                                     between = c("verbalResp"),
+                                                     within = c("reqResp")); show(aov_rt_action_effect_effectPrime_neutral)
+
+# # now contrasts with these results
+# emmeans(aov_rt_action_effect_effectPrime_neutral, ~ reqResp * verbalResp)
+# (contrasts_rt_effect_action_effectPrime_neutral_reqResp_x_verbalResp = pairs(emmeans(aov_rt_action_effect_effectPrime_neutral, ~ reqResp * verbalResp)))
+
+
+
+
+```
+
+
+
+### Graphs Reaction Times
+```{r}
+
+# Effect-Action Order
+plot_rt_effect_action = 
+  ggplot(filter(meanRT, compOrder == "effect_action"),
+         aes(x = reqResp, y = meanRT, fill = verbalResp)) +
+  geom_bar(stat = "summary", fun = mean, position = 'dodge', color = 'black', size = .8) + 
+  geom_errorbar(aes(ymin = meanRT - ci, ymax = meanRT + ci),
+                width = .2,
+                size = .5,
+                position=position_dodge(.9)) +
+  facet_grid(.~ effectPrime) +
+  coord_cartesian(ylim = c(500, 600)) +                                                                  # <---
+  scale_fill_manual(values=c("white", "gray40"))+
+  xlab('Required response') +
+  ylab('Mean response times (ms)') +
+  guides(fill=guide_legend(title="Instructed response")) +
+  ggtitle("Effect-action order") +
+  theme(panel.border = element_blank(),
+        plot.title            = element_text(size = 20, face = "bold", hjust = 0.5),
+        legend.position       = 'none',                                                 #c(0.75, 0.8),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.title          = element_text(size  = 18, face="bold"),
+        legend.text           = element_text(size  = 18),
+        legend.box.background = element_rect(fill  = "white"),
+        plot.background       = element_rect(fill  = "white"),
+        panel.background      = element_rect(fill  = "white"),
+        axis.line.x           = element_line(colour  = "black"),                       # <---
+        axis.line.y           = element_line(colour  = "black"),                       # <---
+        axis.title.x          = element_text(size  = 18),                              #,hjust = 0.5, vjust = -0.5),
+        axis.title.y          = element_text(size  = 18),                              #,hjust = 0.5, vjust = 2),
+        #plot.title            = element_text(hjust = 0.5), 
+        strip.text.x          = element_text(size  = 18, color = 'black'),
+        axis.text.x           = element_text(size  = 18, color = 'black'),
+        axis.text.y           = element_text(size  = 16, color = 'black')
+  ); plot_rt_effect_action
+
+
+# Action-Effect Order
+plot_rt_action_effect = 
+  ggplot(filter(meanRT, compOrder == "action_effect"),
+         aes(x = reqResp, y = meanRT, fill = verbalResp)) +
+  geom_bar(stat = "summary", fun = mean, position = 'dodge', color = 'black', size = .8) + 
+  geom_errorbar(aes(ymin = meanRT - ci, ymax = meanRT + ci),
+                width=.2,
+                size= .5,
+                position=position_dodge(.9)) +
+  facet_grid(.~ effectPrime) +
+  coord_cartesian(ylim = c(500, 600)) +                                                                  # <---
+  scale_fill_manual(values=c("white", "gray40"))+
+  xlab('Required response') +
+  ylab('Mean response times (ms)') +
+  guides(fill=guide_legend(title="Instructed response")) +
+  ggtitle("Action-effect order") +
+  theme(panel.border = element_blank(),
+        plot.title            = element_text(size = 20, face = "bold", hjust = 0.5),
+        legend.position       = 'none',                                                 #c(0.75, 0.8),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.title          = element_text(size  = 18, face="bold"),
+        legend.text           = element_text(size  = 18),
+        legend.box.background = element_rect(fill  = "white"),
+        plot.background       = element_rect(fill  = "white"),
+        panel.background      = element_rect(fill  = "white"),
+        axis.line.x           = element_line(colour  = "black"),                       # <---
+        axis.line.y           = element_line(colour  = "black"),                       # <---
+        axis.title.x          = element_text(size  = 18),                              #,hjust = 0.5, vjust = -0.5),
+        axis.title.y          = element_text(size  = 18),                              #,hjust = 0.5, vjust = 2),
+        #plot.title            = element_text(hjust = 0.5), 
+        strip.text.x          = element_text(size  = 18, color = 'black'),
+        axis.text.x           = element_text(size  = 18, color = 'black'),
+        axis.text.y           = element_text(size  = 16, color = 'black')
+  ); plot_rt_action_effect
+
+
+
+## Combined
+plot_rt = ggarrange(plot_rt_effect_action, plot_rt_action_effect,
+                             labels = c('a.', 'b.'), ncol = 2, nrow = 1,  common.legend = F); plot_rt
+
+```
+
+
