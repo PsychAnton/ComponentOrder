@@ -1,5 +1,10 @@
 ---
 title: "Component Order in Learning from Verbal Information"
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+    encoding=encoding,
+    output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
 author: "Anton Koger"
 date: "`r Sys.Date()`"
 output:
@@ -37,7 +42,7 @@ library(ggplot2)
 ## Importing Data 
 ```{r}
 # set working directory
-setwd("./data")
+setwd("C:/Users/anton/OneDrive - Students RWTH Aachen University/Uni Master/5_UiT/Experiments/data")
 
 
 # create list with all files with the task from all versions
